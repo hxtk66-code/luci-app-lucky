@@ -198,6 +198,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/bin"
+          # The official SDK image drops privileges to its own "buildbot" user,
+          # whose UID does not match the runner's. Make the bind-mounted output
+          # directory writable from inside the container; ownership is restored
+          # after docker exits.
+          chmod 777 "$GITHUB_WORKSPACE/bin"
 
           cat > "$GITHUB_WORKSPACE/.sdk-build.sh" <<'SCRIPT'
           set -euo pipefail
