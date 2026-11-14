@@ -1,6 +1,6 @@
 name: Release packages
 
-# Builds installable Lucky packages with the official OpenWrt SDK action and
+# Builds installable Lucky packages in the official OpenWrt SDK container and
 # publishes them to a GitHub Release. This workflow is deliberately separate
 # from build.yml: build.yml is the upstream CI (static checks + smoke builds),
 # this one is the packaging/release pipeline.
@@ -185,14 +185,50 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Same pinned revision as build.yml, so both workflows use one SDK action.
-      # "uses" cannot read the env context, so the ref is written literally.
-      - name: Build with the official OpenWrt SDK action
-        uses: openwrt/gh-action-sdk@f5813d30eeef3534b58ac7e79c5d8842b6035434
+      # gh-action-sdk runs "make package/<pkg>/check" and unconditionally fails
+      # on "HASH uses deprecated hash". lucky/Makefile needs PKG_HASH:=skip by
+      # design (one upstream tarball per architecture), so that check can never
+      # pass here. Drive the same official SDK image with the repository's own
+      # scripts/build-sdk.sh instead, which installs the feed and compiles
+      # directly without the package check.
+      - name: Build with the official OpenWrt SDK container
+        shell: bash
         env:
-          ARCH: ${{ matrix.sdk }}
-          BUILD_LOG: 1
-          PACKAGES: lucky luci-app-lucky
+          SDK: ${{ matrix.sdk }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/bin"
+
+          cat > "$GITHUB_WORKSPACE/.sdk-build.sh" <<'SCRIPT'
+          set -euo pipefail
+          bash /work/repo/scripts/build-sdk.sh /builder /work/repo
+          mkdir -p /work/output/packages /work/output/logs
+          cp -a /builder/bin/packages/. /work/output/packages/
+          if [ -d /builder/logs ]; then
+            cp -a /builder/logs/. /work/output/logs/ || true
+          fi
+          SCRIPT
+
+          docker run --rm \
+            --workdir /builder \
+            --env LUCKY_MAKE_JOBS=2 \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/work/repo,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/bin,target=/work/output" \
+            "ghcr.io/openwrt/sdk:$SDK" \
+            /bin/bash /work/repo/.sdk-build.sh
+
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE/bin" || true
+          echo "=== Packages produced by the SDK ==="
+          find bin/packages -type f \( -name '*.ipk' -o -name '*.apk' \) -print | sort
+
+      - name: Upload SDK logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-logs-${{ matrix.format }}-${{ matrix.arch }}
+          path: bin/logs/**
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Collect packages and create archive
         id: pack
