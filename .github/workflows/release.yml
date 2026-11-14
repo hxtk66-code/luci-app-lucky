@@ -1,0 +1,595 @@
+name: Release packages
+
+# Builds installable Lucky packages with the official OpenWrt SDK action and
+# publishes them to a GitHub Release. This workflow is deliberately separate
+# from build.yml: build.yml is the upstream CI (static checks + smoke builds),
+# this one is the packaging/release pipeline.
+#
+#   * OpenWrt 24.10.8 (opkg) -> .ipk
+#   * OpenWrt 25.12.5 (apk)  -> .apk
+#
+# Every push to main refreshes the rolling "latest" Release with an x86_64
+# build of both formats. Pushing a v* tag publishes a version Release.
+# A manual single-architecture run does not touch "latest" unless
+# "publish = always" is chosen explicitly.
+#
+# Each archive contains exactly one format: the architecture-specific
+# "lucky" core plus the two architecture-independent LuCI packages.
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'Package architecture (all = every architecture in scripts/build-matrix.json)'
+        required: true
+        default: 'x86_64'
+        type: choice
+        options:
+          - all
+          - x86_64
+          - aarch64_cortex-a53
+          - aarch64_cortex-a72
+          - aarch64_generic
+          - arm_cortex-a7
+          - arm_cortex-a9
+          - mips_24kc
+          - mipsel_24kc
+          - i386_pentium4
+      format:
+        description: 'Package format (both = ipk + apk)'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - both
+          - ipk
+          - apk
+      publish:
+        description: 'Publish a Release (auto = only full builds)'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - always
+          - never
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+# Keep push and manual runs in separate groups so triggering a push build
+# cannot cancel an in-progress single-architecture trial run.
+concurrency:
+  group: release-pkg-${{ github.event_name }}-${{ github.ref }}-${{ inputs.arch || 'auto' }}-${{ inputs.format || 'both' }}
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Prepare matrix
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build-matrix: ${{ steps.matrix.outputs.build-matrix }}
+      format-matrix: ${{ steps.matrix.outputs.format-matrix }}
+      job-count: ${{ steps.matrix.outputs.job-count }}
+      arch-count: ${{ steps.matrix.outputs.arch-count }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            # Only real v* version tags count. The automatically created
+            # "latest" / "latest-<arch>" rolling tags must not become versions.
+            VERSION=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null \
+                      || echo "dev-${GITHUB_SHA::7}")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version: $VERSION"
+
+      - name: Select architectures and formats
+        id: matrix
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          SELECTED: ${{ inputs.arch || '' }}
+          FORMAT: ${{ inputs.format || '' }}
+          APK_VER: '25.12.5'
+          IPK_VER: '24.10.8'
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          catalogue = json.load(open('scripts/build-matrix.json', encoding='utf-8'))
+          versions = {'ipk': os.environ['IPK_VER'], 'apk': os.environ['APK_VER']}
+          event = os.environ['EVENT']
+          selected = os.environ.get('SELECTED', '')
+          fmt = os.environ.get('FORMAT', '') or 'both'
+
+          formats = ['ipk', 'apk'] if fmt == 'both' else [fmt]
+          if any(f not in versions for f in formats):
+              print('::error::unsupported package format')
+              sys.exit(1)
+
+          # Pushes (and therefore automatic Releases) build x86_64 only.
+          # "all" in a manual run is the opt-in path for the full matrix.
+          if event == 'workflow_dispatch' and selected == 'all':
+              chosen = None
+          elif event == 'workflow_dispatch' and selected:
+              chosen = {selected}
+          else:
+              chosen = {'x86_64'}
+
+          matrix = []
+          for f in formats:
+              available = [item['package_arch'] for item in catalogue[f]]
+              if chosen is None:
+                  targets = available
+              else:
+                  targets = [a for a in available if a in chosen]
+                  missing = chosen - set(targets)
+                  if missing:
+                      print(f"::warning::{f}: no SDK entry for {sorted(missing)}, skipped")
+              for a in targets:
+                  matrix.append({
+                      'arch': a,
+                      'format': f,
+                      'version': versions[f],
+                      # openwrt/gh-action-sdk expects "<package_arch>-<sdk version>".
+                      'sdk': f"{a}-{versions[f]}",
+                  })
+
+          if not matrix:
+              print('::error::empty build matrix')
+              sys.exit(1)
+
+          # A whole-matrix expression is the supported dynamic-matrix form:
+          # strategy.matrix = ${{ fromJSON(needs.prepare.outputs.build-matrix) }}
+          payload = json.dumps({'include': matrix}, separators=(',', ':'))
+          arches = sorted({m['arch'] for m in matrix})
+          out = os.environ['GITHUB_OUTPUT']
+          with open(out, 'a', encoding='utf-8') as fh:
+              fh.write(f'build-matrix={payload}\n')
+              fh.write('format-matrix=' + json.dumps(formats, separators=(',', ':')) + '\n')
+              fh.write(f'job-count={len(matrix)}\n')
+              fh.write(f'arch-count={len(arches)}\n')
+          print(f'Selected {len(matrix)} SDK jobs across {len(arches)} architectures:')
+          for m in matrix:
+              print(f"  - {m['format']:3} {m['arch']:32} sdk={m['sdk']}")
+          PY
+
+  build:
+    name: ${{ matrix.format }} / ${{ matrix.arch }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.build-matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Same pinned revision as build.yml, so both workflows use one SDK action.
+      # "uses" cannot read the env context, so the ref is written literally.
+      - name: Build with the official OpenWrt SDK action
+        uses: openwrt/gh-action-sdk@f5813d30eeef3534b58ac7e79c5d8842b6035434
+        env:
+          ARCH: ${{ matrix.sdk }}
+          BUILD_LOG: 1
+          PACKAGES: lucky luci-app-lucky
+
+      - name: Collect packages and create archive
+        id: pack
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          EXT: ${{ matrix.format }}
+          SDK_VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+
+          echo "=== Packages produced by the SDK ==="
+          find bin/packages -type f -name "*.$EXT" -print | sort || true
+
+          mkdir -p pkg-out core-out
+
+          # "lucky" is architecture-specific and must come from this SDK's own
+          # feed directory. Some older SDKs write to a different ARCH_PACKAGES
+          # name, so fall back to the whole tree only when that directory has
+          # no core package.
+          collect_core() {
+            local root=$1
+            find "$root" -type f -name "*.$EXT" -print 2>/dev/null | sort | \
+              while IFS= read -r f; do
+                case "${f##*/}" in
+                  lucky[_-]*) printf '%s\n' "$f" ;;
+                esac
+              done
+          }
+
+          mapfile -t core_files < <(collect_core "bin/packages/$ARCH")
+          if [ "${#core_files[@]}" -eq 0 ]; then
+            echo "::warning::bin/packages/$ARCH has no lucky core, falling back to bin/packages"
+            mapfile -t core_files < <(collect_core bin/packages)
+          fi
+          if [ "${#core_files[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one lucky core .$EXT, found ${#core_files[@]}"
+            printf '  %s\n' "${core_files[@]}"
+            exit 1
+          fi
+          cp -f "${core_files[0]}" core-out/
+          cp -f "${core_files[0]}" pkg-out/
+
+          # The LuCI app and the zh-cn translation are "all" packages. They
+          # live in bin/packages/all/ and are identical for every SDK, so
+          # deduplicate by file name before copying.
+          declare -A seen=()
+          while IFS= read -r f; do
+            case "${f##*/}" in
+              luci-app-lucky[_-]*|luci-i18n-lucky-zh-cn[_-]*) ;;
+              *) continue ;;
+            esac
+            base=${f##*/}
+            if [ -n "${seen[$base]:-}" ]; then
+              continue
+            fi
+            seen[$base]=1
+            cp -f "$f" pkg-out/
+          done < <(find bin/packages -type f -name "*.$EXT" -print | sort)
+
+          if ! find pkg-out -maxdepth 1 -type f -name "luci-app-lucky*.$EXT" | grep -q .; then
+            echo "::error::luci-app-lucky .$EXT was not produced"
+            exit 1
+          fi
+          if ! find pkg-out -maxdepth 1 -type f -name "luci-i18n-lucky-zh-cn*.$EXT" | grep -q .; then
+            echo "::warning::zh-cn translation package was not produced"
+          fi
+
+          # Hard guarantee: an archive can only ever contain one format.
+          find pkg-out -maxdepth 1 -type f ! -name "*.$EXT" -delete
+          BAD=$(find pkg-out -maxdepth 1 -type f ! -name "*.$EXT" | wc -l)
+          test "$BAD" -eq 0
+          COUNT=$(find pkg-out -maxdepth 1 -type f -name "*.$EXT" | wc -l)
+          test "$COUNT" -ge 2
+
+          ARCHIVE="openwrt-${SDK_VERSION}-${ARCH}-${EXT}.tar.gz"
+          tar -zcvf "$ARCHIVE" -C pkg-out .
+          echo "=== Archive contents ($COUNT packages) ==="
+          tar -tzf "$ARCHIVE"
+          sha256sum pkg-out/*."$EXT"
+
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload standalone core package
+        uses: actions/upload-artifact@v4
+        with:
+          name: core-${{ matrix.format }}-${{ matrix.arch }}
+          path: core-out/*.${{ matrix.format }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.format }}-${{ matrix.arch }}
+          path: ${{ steps.pack.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish Release
+    needs: [prepare, build]
+    # A single upload job avoids the race where every matrix job replaces
+    # the release assets of all the others.
+    # Push builds (x86_64 only) publish automatically. A manual single-arch
+    # trial never overwrites "latest" unless publish=always was chosen.
+    if: >-
+      ${{
+        always() &&
+        needs.build.result == 'success' &&
+        inputs.publish != 'never' &&
+        (github.event_name != 'workflow_dispatch' ||
+         inputs.publish == 'always' ||
+         inputs.arch == 'all' ||
+         inputs.arch == '')
+      }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine release target
+        id: meta
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          SELECTED: ${{ inputs.arch || '' }}
+          PUBLISH: ${{ inputs.publish || '' }}
+          FORMAT: ${{ inputs.format || 'both' }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "push" ] && [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG="$REF_NAME"
+            NAME="OpenWrt Packages $REF_NAME"
+            PRERELEASE=false
+            LABEL="Version release"
+          elif [ "$EVENT" = "workflow_dispatch" ] && [ "$PUBLISH" = "always" ] \
+               && [ -n "$SELECTED" ] && [ "$SELECTED" != "all" ]; then
+            # Keep a forced single-architecture / single-format release away
+            # from "latest" so it cannot strip the other format's assets.
+            TAG="latest-${SELECTED}-${FORMAT}"
+            NAME="OpenWrt Packages ($SELECTED / $FORMAT trial build)"
+            PRERELEASE=true
+            LABEL="Single-architecture trial"
+          else
+            TAG="latest"
+            NAME="OpenWrt Packages (latest build)"
+            PRERELEASE=false
+            LABEL="Rolling automatic build"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          echo "label=$LABEL" >> "$GITHUB_OUTPUT"
+          echo "Release target: tag=$TAG, name=$NAME, prerelease=$PRERELEASE"
+
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download standalone core packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: core-*
+          path: dist
+          merge-multiple: true
+
+      - name: Extract standalone LuCI packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The two "all" packages are identical in every archive. Publish one
+          # copy per format so they can be downloaded without opening an archive.
+          mkdir -p .all-pkgs
+          for ext in ipk apk; do
+            archive=$(find dist -maxdepth 1 -type f -name "*-${ext}.tar.gz" -print -quit)
+            [ -n "$archive" ] || continue
+            rm -rf .all-pkgs/"$ext"
+            mkdir -p .all-pkgs/"$ext"
+            tar -xzf "$archive" -C .all-pkgs/"$ext"
+            find .all-pkgs/"$ext" -maxdepth 1 -type f \
+              \( -name "luci-app-lucky*.$ext" -o -name "luci-i18n-lucky-zh-cn*.$ext" \) \
+              -exec cp -f '{}' dist/ ';'
+          done
+          echo "=== Standalone files in dist ==="
+          find dist -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Verify release payload
+        id: verify
+        shell: bash
+        env:
+          FORMAT_MATRIX: ${{ needs.prepare.outputs.format-matrix }}
+          JOB_COUNT: ${{ needs.prepare.outputs.job-count }}
+        run: |
+          set -euo pipefail
+          # GitHub replaces "~" in a release asset name with "."; normalise it
+          # ourselves so that replacesArtifacts can match existing assets.
+          for f in dist/*; do
+            [ -f "$f" ] || continue
+            base=${f##*/}
+            normalised=$(printf '%s' "$base" | tr '~' '.')
+            if [ "$base" != "$normalised" ]; then
+              mv -f "$f" "dist/$normalised"
+            fi
+          done
+
+          ARCHIVES=$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l)
+          IPKS=$(find dist -maxdepth 1 -type f -name '*.ipk' | wc -l)
+          APKS=$(find dist -maxdepth 1 -type f -name '*.apk' | wc -l)
+          OTHERS=$(find dist -maxdepth 1 -type f ! -name '*.tar.gz' ! -name '*.ipk' ! -name '*.apk' | wc -l)
+          echo "tar.gz archives: $ARCHIVES, standalone .ipk: $IPKS, standalone .apk: $APKS, other: $OTHERS"
+          test "$ARCHIVES" -ge 1
+          test "$OTHERS" -eq 0
+          case "$FORMAT_MATRIX" in
+            *ipk*) test "$IPKS" -gt 0 || { echo "::error::Missing .ipk packages"; exit 1; } ;;
+            *)     test "$IPKS" -eq 0 || { echo "::error::Unexpected .ipk packages"; exit 1; } ;;
+          esac
+          case "$FORMAT_MATRIX" in
+            *apk*) test "$APKS" -gt 0 || { echo "::error::Missing .apk packages"; exit 1; } ;;
+            *)     test "$APKS" -eq 0 || { echo "::error::Unexpected .apk packages"; exit 1; } ;;
+          esac
+
+          # Each archive must contain exactly its own format.
+          for f in dist/*.tar.gz; do
+            ext=ipk
+            case "$f" in *-apk.tar.gz) ext=apk ;; esac
+            BAD=$(tar -tzf "$f" | grep -vE "\\.${ext}\$|/+\$|^(\\.|\\./)?\$" || true)
+            if [ -n "$BAD" ]; then
+              echo "::error::$f contains unexpected files: $BAD"
+              exit 1
+            fi
+          done
+
+          echo "archive_count=$ARCHIVES" >> "$GITHUB_OUTPUT"
+          echo "ipk_count=$IPKS" >> "$GITHUB_OUTPUT"
+          echo "apk_count=$APKS" >> "$GITHUB_OUTPUT"
+          echo "Expected SDK jobs: $JOB_COUNT, archives: $ARCHIVES"
+
+      - name: Generate checksums and manifest
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          FORMAT_MATRIX: ${{ needs.prepare.outputs.format-matrix }}
+          ARCH_COUNT: ${{ needs.prepare.outputs.arch-count }}
+        run: |
+          set -euo pipefail
+          # Use find rather than bare globs: with only one format selected,
+          # an unmatched glob would make sha256sum exit non-zero under pipefail.
+          (cd dist && find . -maxdepth 1 -type f \
+            \( -name '*.tar.gz' -o -name '*.ipk' -o -name '*.apk' \) \
+            -printf '%f\n' | sort | xargs -r sha256sum > SHA256SUMS)
+          python3 - <<'PY'
+          import json
+          import os
+
+          files = []
+          with open('dist/SHA256SUMS', encoding='utf-8') as fh:
+              for line in fh:
+                  digest, name = line.split(None, 1)
+                  files.append({'file': name.strip(), 'sha256': digest})
+
+          manifest = {
+              'schema': 1,
+              'version': os.environ['VERSION'],
+              'commit': os.environ['GITHUB_SHA'],
+              'run_number': int(os.environ['GITHUB_RUN_NUMBER']),
+              'formats': json.loads(os.environ['FORMAT_MATRIX']),
+              'architectures': int(os.environ['ARCH_COUNT']),
+              'sdk': {
+                  'ipk': 'openwrt-24.10.8',
+                  'apk': 'openwrt-25.12.5',
+              },
+              'files': files,
+          }
+          with open('dist/MANIFEST.json', 'w', encoding='utf-8') as fh:
+              json.dump(manifest, fh, indent=2, ensure_ascii=False)
+              fh.write('\n')
+          print(f"MANIFEST.json: {len(files)} files")
+          PY
+          echo "=== SHA256SUMS ==="
+          cat dist/SHA256SUMS
+
+      - name: Generate release notes
+        id: release_notes
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          LABEL: ${{ steps.meta.outputs.label }}
+          ARCHIVE_COUNT: ${{ steps.verify.outputs.archive_count }}
+          IPK_COUNT: ${{ steps.verify.outputs.ipk_count }}
+          APK_COUNT: ${{ steps.verify.outputs.apk_count }}
+          ARCH_COUNT: ${{ needs.prepare.outputs.arch-count }}
+        run: |
+          set -euo pipefail
+          BUILD_TIME=$(date -u +'%Y-%m-%d %H:%M UTC')
+          {
+            echo "# OpenWrt Packages $VERSION"
+            echo
+            echo "> $LABEL - generated automatically by the Release packages workflow."
+            echo "> Commit \`$GITHUB_SHA\` | run #$GITHUB_RUN_NUMBER | $BUILD_TIME | $ARCHIVE_COUNT archives."
+            echo
+            echo "- OpenWrt 24.10.8 SDK: opkg / \`.ipk\` packages"
+            echo "- OpenWrt 25.12.5 SDK: apk / \`.apk\` packages"
+            echo "- One archive per SDK and architecture; each archive contains one format only."
+            echo "- \`$ARCH_COUNT\` package architectures, \`$IPK_COUNT\` standalone .ipk and \`$APK_COUNT\` standalone .apk files."
+            echo
+            echo "## Package Overview"
+            echo
+            echo "| Package | Version | Architecture |"
+            echo "|---------|---------|--------------|"
+            for dir in lucky luci-app-lucky; do
+              name=$(grep -m1 '^PKG_NAME' "$dir/Makefile" | cut -d'=' -f2 | tr -d '[:space:]')
+              ver=$(grep -m1 '^PKG_VERSION' "$dir/Makefile" | cut -d'=' -f2 | tr -d '[:space:]')
+              rel=$(grep -m1 '^PKG_RELEASE' "$dir/Makefile" | cut -d'=' -f2 | tr -d '[:space:]')
+              arch=all
+              if [ "$dir" = lucky ]; then
+                arch='per target'
+              fi
+              echo "| \`$name\` | \`$ver-$rel\` | $arch |"
+            done
+            echo "| \`luci-i18n-lucky-zh-cn\` | generated by luci.mk | all |"
+            echo
+            echo "## Archives (one per SDK and architecture)"
+            echo
+            find dist -maxdepth 1 -type f -name '*.tar.gz' -printf '%f\n' | sort | while read -r f; do
+              echo "- \`$f\`"
+            done
+            echo
+            echo "<details>"
+            echo "<summary>Standalone packages</summary>"
+            echo
+            find dist -maxdepth 1 -type f \( -name '*.ipk' -o -name '*.apk' \) -printf '%f\n' | sort | while read -r f; do
+              echo "- \`$f\`"
+            done
+            echo
+            echo "</details>"
+            echo
+            echo "## Installation"
+            echo
+            echo "Upload the matching packages to \`/tmp\` on the router, then:"
+            echo
+            echo '```sh'
+            echo '# OpenWrt 24.10 (opkg)'
+            echo 'opkg install /tmp/lucky_*.ipk'
+            echo 'opkg install /tmp/luci-app-lucky_*.ipk /tmp/luci-i18n-lucky-zh-cn_*.ipk'
+            echo
+            echo '# OpenWrt 25.12 (apk)'
+            echo 'apk add --allow-untrusted /tmp/lucky-*.apk'
+            echo 'apk add --allow-untrusted /tmp/luci-app-lucky-*.apk /tmp/luci-i18n-lucky-zh-cn-*.apk'
+            echo '```'
+            echo
+            echo "Install all three packages of one format; never mix \`.ipk\` and \`.apk\` on the same system."
+            echo "The \`lucky\` core package must match the device's OpenWrt version and package architecture."
+            echo "After installation open **Services → Lucky** in LuCI."
+            echo
+            echo "## Changelog"
+            echo
+            PREV_TAG=$(git describe --tags --abbrev=0 --match 'v*' HEAD^ 2>/dev/null || true)
+            if [ -n "$PREV_TAG" ]; then
+              echo "Changes since $PREV_TAG:"
+              echo
+              git log --pretty=format:'- %s (%h)' "$PREV_TAG"..HEAD || true
+            else
+              git log --pretty=format:'- %s (%h)' -10 || true
+            fi
+            echo
+            echo
+            echo "## Credits"
+            echo
+            echo "- [gdy666/lucky](https://github.com/gdy666/lucky) - Lucky upstream"
+            echo "- [OpenWrt SDK](https://downloads.openwrt.org/) - official build SDKs"
+          } > release-notes.md
+          {
+            echo "notes<<EOF"
+            cat release-notes.md
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          cat release-notes.md
+
+      - name: Upload archives and packages to Release
+        uses: ncipollo/release-action@v1
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          tag: ${{ steps.meta.outputs.tag }}
+          # The action creates the tag when it is missing, but needs an
+          # explicit commit reference in that case ("latest" is auto-created).
+          commit: ${{ github.sha }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          allowUpdates: true
+          # removeArtifacts clears the old asset list first, so a version bump
+          # cannot leave stale ipk/apk file names behind.
+          removeArtifacts: true
+          replacesArtifacts: true
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          artifacts: "dist/*.tar.gz,dist/*.ipk,dist/*.apk,dist/SHA256SUMS,dist/MANIFEST.json"
+          body: ${{ steps.release_notes.outputs.notes }}
