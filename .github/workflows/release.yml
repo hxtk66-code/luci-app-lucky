@@ -156,8 +156,8 @@ jobs:
               print('::error::empty build matrix')
               sys.exit(1)
 
-          # A whole-matrix expression is the supported dynamic-matrix form:
-          # strategy.matrix = ${{ fromJSON(needs.prepare.outputs.build-matrix) }}
+          # Emit a whole-matrix object (an "include" array) so the build job
+          # can consume it as its dynamic strategy.matrix.
           payload = json.dumps({'include': matrix}, separators=(',', ':'))
           arches = sorted({m['arch'] for m in matrix})
           out = os.environ['GITHUB_OUTPUT']
@@ -177,7 +177,9 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare.outputs.build-matrix) }}
+      # Fall back to an empty matrix if prepare failed, so the template itself
+      # never becomes invalid while evaluating this job.
+      matrix: ${{ fromJSON(needs.prepare.outputs.build-matrix || '{"include":[]}') }}
     steps:
       - uses: actions/checkout@v4
         with:
